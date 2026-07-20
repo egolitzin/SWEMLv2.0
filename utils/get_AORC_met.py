@@ -124,11 +124,11 @@ def get_aorc_wy_daily(WY, output_res, thresh, save_path=None):
     and save the result as a zarr store.
 
     Daily output variables:
-        APCP_surface        - Total precipitation daily sum (cm)
-        SNOW_regression     - Snow daily sum via Jennings et al. (2018) logistic regression (cm)
-        RAIN_regression     - Rain daily sum via Jennings et al. (2018) logistic regression (cm)
-        SNOW_wetbulb        - Snow daily sum via Stull (2011) wet-bulb temp (cm)
-        RAIN_wetbulb        - Rain daily sum via Stull (2011) wet-bulb temp (cm)
+        APCP_surface        - Total precipitation daily sum (mm)
+        SNOW_regression     - Snow daily sum via Jennings et al. (2018) logistic regression (mm)
+        RAIN_regression     - Rain daily sum via Jennings et al. (2018) logistic regression (mm)
+        SNOW_wetbulb        - Snow daily sum via Stull (2011) wet-bulb temp (mm)
+        RAIN_wetbulb        - Rain daily sum via Stull (2011) wet-bulb temp (mm)
         DSWRF_surface       - Downward shortwave radiation daily mean (W/m^2)
         DLWRF_surface       - Downward longwave radiation daily mean (W/m^2)
         PRES_surface        - Pressure daily mean (Pa)
@@ -192,9 +192,11 @@ def get_aorc_wy_daily(WY, output_res, thresh, save_path=None):
 
     # chunks={} uses native AORC zarr tile sizes w/ no S3 object sub-division
     ds = xr.open_mfdataset(fileset, engine="zarr", consolidated=True, chunks={})
+    lat_asc = ds.latitude.values[0] < ds.latitude.values[-1]
+    lat_s   = slice(bottom, top) if lat_asc else slice(top, bottom)
     ds_wy = ds.sel(
         time=slice(WY_start, WY_end),
-        latitude=slice(bottom, top),
+        latitude=lat_s,
         longitude=slice(left, right)
     )
 
@@ -214,7 +216,7 @@ def get_aorc_wy_daily(WY, output_res, thresh, save_path=None):
                    'UGRD_10maboveground', 'VGRD_10maboveground',
                    'Tw','P_snow']
 
-    ds_daily_precip = ds_wy[precip_vars].resample(time='1D').sum() / 10.0  # kg/m^2 → cm
+    ds_daily_precip = ds_wy[precip_vars].resample(time='1D').sum()  # kg/m^2 = mm
     ds_daily = xr.merge([
         ds_daily_precip,
         ds_wy[mean_vars].resample(time='1D').mean(),
@@ -289,9 +291,11 @@ def get_aorc_precip(WY, output_res, thresh):
     ]
     print("Streaming AORC daily precip from S3 (union bbox, chunked) ...")
     ds_yrs = xr.open_mfdataset(fileset, engine='zarr', chunks={})
+    lat_asc  = ds_yrs.latitude.values[0] < ds_yrs.latitude.values[-1]
+    bbox_lat = slice(bbox_bottom, bbox_top) if lat_asc else slice(bbox_top, bbox_bottom)
     da_bbox_full = (
         ds_yrs['APCP_surface']
-        .sel(latitude=slice(bbox_bottom, bbox_top),
+        .sel(latitude=bbox_lat,
              longitude=slice(bbox_left, bbox_right))
         .resample(time='1D').sum()
     )
@@ -316,9 +320,10 @@ def get_aorc_precip(WY, output_res, thresh):
         top    = training_df['cen_lat'].max() + 0.1
 
         # Spatial + temporal slice from in-memory array (pure numpy, no S3)
+        lat_s    = slice(bottom, top) if lat_asc else slice(top, bottom)
         da_slice = da_loaded.sel(
             time=slice(obs_start, obs_end),
-            latitude=slice(bottom, top),
+            latitude=lat_s,
             longitude=slice(left, right),
         )
 
@@ -328,14 +333,14 @@ def get_aorc_precip(WY, output_res, thresh):
 
         prcp_all = da_slice.sel(latitude=lats, longitude=lons, method='nearest')
         raw_vals = prcp_all.values          # shape (time, npoints)
-        season_precip_cm = np.round(raw_vals.sum(axis=0) / 10, 2)
+        season_precip_mm = np.round(raw_vals.sum(axis=0), 2)
 
         precip_df = pd.DataFrame({
             'cell_id':          meta['cell_id'].values,
             'cen_lat':          meta['cen_lat'].values,
             'cen_lon':          meta['cen_lon'].values,
             'precip':           list(raw_vals.T),
-            'season_precip_cm': season_precip_cm,
+            'season_precip_mm': season_precip_mm,
         })
 
         table = pa.Table.from_pandas(precip_df)
@@ -351,21 +356,21 @@ def add_aorc_df(WY, output_res, threshold):
 
     Reads from:
         {HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/
-            gridMETNLDASDaymet_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/
+            NLDAS_gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/
             {threshold}_fSCA_Thresh/
 
     Writes to:
         {HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/
-            AORCgridMETNLDASDaymet_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/
+            AORC_NLDAS_gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/
             {threshold}_fSCA_Thresh/
 
     New columns added to each DF
     -----------------------------
-    AORC_precip       : season-to-date total precipitation (cm)
-    AORC_snow_reg     : season-to-date snow via Jennings et al. (2018) logistic regression (cm)
-    AORC_rain_reg     : season-to-date rain via Jennings et al. (2018) logistic regression (cm)
-    AORC_snow_wb      : season-to-date snow via Stull (2011) wet-bulb linear ramp (cm)
-    AORC_rain_wb      : season-to-date rain via Stull (2011) wet-bulb linear ramp (cm)
+    AORC_precip       : season-to-date total precipitation (mm)
+    AORC_snow_reg     : season-to-date snow via Jennings et al. (2018) logistic regression (mm)
+    AORC_rain_reg     : season-to-date rain via Jennings et al. (2018) logistic regression (mm)
+    AORC_snow_wb      : season-to-date snow via Stull (2011) wet-bulb linear ramp (mm)
+    AORC_rain_wb      : season-to-date rain via Stull (2011) wet-bulb linear ramp (mm)
     AORC_APDD         : accumulated positive degree-days since Oct 1 (°C·days); sum of max(Tmean, 0)
     AORC_T7d          : 7-day mean air temperature ending on obs date (°C)
     AORC_T14d         : 14-day mean air temperature ending on obs date (°C)
@@ -383,12 +388,12 @@ def add_aorc_df(WY, output_res, threshold):
     """
     training_df_path = (
         f"{HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/"
-        f"gridMETNLDASDaymet_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/"
+        f"NLDAS_gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/"
         f"{threshold}_fSCA_Thresh"
     )
     df_path = (
         f"{HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/"
-        f"AORCgridMETNLDASDaymet_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/"
+        f"AORC_NLDAS_gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/"
         f"{threshold}_fSCA_Thresh"
     )
     os.makedirs(df_path, exist_ok=True)
@@ -402,6 +407,7 @@ def add_aorc_df(WY, output_res, threshold):
 
     print(f"Opening AORC daily zarr for WY{WY} from {zarr_path}")
     ds_aorc = xr.open_zarr(zarr_path)
+    lat_asc  = ds_aorc.latitude.values[0] < ds_aorc.latitude.values[-1]
 
     WY_start = f"{WY-1}-10-01"
 
@@ -426,9 +432,10 @@ def add_aorc_df(WY, output_res, threshold):
 
         aorc_vars = ['APCP_surface', 'SNOW_regression', 'RAIN_regression', 'SNOW_wetbulb', 'RAIN_wetbulb',
                     'TMP_2maboveground', 'DSWRF_surface']
+        lat_s    = slice(bottom, top) if lat_asc else slice(top, bottom)
         ds_slice = ds_aorc[aorc_vars].sel(
             time=slice(WY_start, strdate),
-            latitude=slice(bottom, top),
+            latitude=lat_s,
             longitude=slice(left, right),
         )
 
