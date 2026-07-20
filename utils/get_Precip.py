@@ -1,366 +1,644 @@
+import io
+import os
+import time as time_module
+import urllib.request
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+
+import earthaccess
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import xarray as xr
-
-#data packages
-# import pydaymet as daymet ## Issues with this package and API -- skipping for now
-# import pynldas2 as nldas
-import pygridmet as gridmet
-from pygridmet import GridMET
-# import ee #pip install earthengine-api
-# import utils.EE_funcs as EE_funcs
-import urllib.request
-import zipfile
-
-#multiprocessing
 from tqdm.auto import tqdm
-import concurrent.futures as cf
 
-#raster packages
-import rasterio
-
-import os
-from datetime import datetime, timedelta
-
-import boto3
-import s3fs
-# ee.Authenticate()
-# ee.Initialize()
 import warnings
 warnings.filterwarnings("ignore")
 
-#load access key
 HOME = os.getcwd()
-KEYPATH = "utils/AWSaccessKeys.csv"
 
-if os.path.isfile(f"{HOME}/{KEYPATH}") == True:
-    ACCESS = pd.read_csv(f"{HOME}/{KEYPATH}")
-
-    #start session
-    SESSION = boto3.Session(
-        aws_access_key_id=ACCESS['Access key ID'][0],
-        aws_secret_access_key=ACCESS['Secret access key'][0],
-    )
-    S3 = SESSION.resource('s3')
-    #AWS BUCKET information
-    BUCKET_NAME = 'national-snow-model'
-    #S3 = boto3.resource('S3', config=Config(signature_version=UNSIGNED))
-    BUCKET = S3.Bucket(BUCKET_NAME)
-else:
-    print(f"no AWS credentials present, {HOME}/{KEYPATH}")
-    
-#set multiprocessing limits
 CPUS = len(os.sched_getaffinity(0))
-CPUS = int((CPUS/2)-2)
-    
+CPUS = int((CPUS / 2) - 2)
 
-def ProcessDates(args):
-    date, WY_precip, Precippath = args
-    ts = pd.to_datetime(str(date)) 
-    d = ts.strftime('%Y-%m-%d')
-    filed = d = ts.strftime('%Y%m%d')
-    precipdf = WY_precip[WY_precip['datetime'] == d]
-    precipdf.set_index('cell_id', inplace = True)
-    precipdf.pop('datetime')
-    precipdf['season_precip_cm'] = round(precipdf['season_precip_cm'],1)
-    #Convert DataFrame to Apache Arrow Table
-    table = pa.Table.from_pandas(precipdf)
-    # Parquet with Brotli compression
-    pq.write_table(table, f"{Precippath}/NLDAS_PPT_{filed}.parquet", compression='BROTLI')
+THREDDS_BASE = (
+    'http://thredds.northwestknowledge.net:8080'
+    '/thredds/dodsC/MET/{var}/{var}_{year}.nc'
+)
+
+NLDAS_BASE = 'https://data.gesdisc.earthdata.nasa.gov/data/NLDAS/NLDAS_FORA0125_H.2.0'
+NLDAS_VARS = ['Rainf', 'Tair', 'Qair', 'PSurf', 'SWdown']
 
 
-def Make_Precip_DF(region, output_res, threshold, dataset):
-    
-    print(f"Adding precipitation features to ML dataframe for {region}.")
-    Precippath = f"{HOME}/data/Precipitation/{region}/{output_res}M_{dataset}_Precip"
+# shared utilities
 
-    #make precip df path
-    if dataset == 'Daymet':
-        PrecipDFpath = f"{HOME}/data/TrainingDFs/{region}/{output_res}M_Resolution/Daymet_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
-        DFpath = f"{HOME}/data/TrainingDFs/{region}/{output_res}M_Resolution/Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
-    ## daymet API currently deprecated, so skip to NLDAS from Veg
-    elif dataset == 'NLDAS':
-        PrecipDFpath = f"{HOME}/data/TrainingDFs/{region}/{output_res}M_Resolution/NLDASDaymet_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
-        DFpath = f"{HOME}/data/TrainingDFs/{region}/{output_res}M_Resolution/DaymetVegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
-    # temporarily skipping to gridmet from veg -- issues with daymet and nldas APIs    
-    elif dataset == 'gridMET':
-        PrecipDFpath = f"{HOME}/data/TrainingDFs/{region}/{output_res}M_Resolution/gridMETNLDASDaymet_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
-        DFpath = f"{HOME}/data/TrainingDFs/{region}/{output_res}M_Resolution/Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
-    elif dataset == 'AORC':
-        PrecipDFpath = f"{HOME}/data/TrainingDFs/{region}/{output_res}M_Resolution/AORCgridMETNLDASDaymet_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
-        DFpath = f"{HOME}/data/TrainingDFs/{region}/{output_res}M_Resolution/gridMETNLDASDaymet_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
-    if not os.path.exists(PrecipDFpath):
-        os.makedirs(PrecipDFpath, exist_ok=True)
+def _collect_centroids(df_dir):
+    """Return DataFrame of unique (cell_id, cen_lat, cen_lon) across all parquets in df_dir."""
+    files = [f for f in os.listdir(df_dir) if f.endswith('.parquet')]
+    if not files:
+        raise FileNotFoundError(f"No training DF parquets in {df_dir}")
+    parts = [
+        pd.read_parquet(os.path.join(df_dir, f), columns=['cell_id', 'cen_lat', 'cen_lon'])
+        for f in files
+    ]
+    return pd.concat(parts, ignore_index=True).drop_duplicates(subset='cell_id').reset_index(drop=True)
 
-    #Get list of dataframes
-    GeoObsDF_files = [filename for filename in os.listdir(DFpath) if filename.endswith('.parquet')]
 
-    with cf.ProcessPoolExecutor(max_workers=CPUS) as executor:
-        futures = {
-            executor.submit(single_date_add_daymet_precip, (DFpath, Precippath, geofile, PrecipDFpath, region, dataset)): geofile
-            for geofile in GeoObsDF_files
-        }
-        for future in tqdm(cf.as_completed(futures), total=len(futures)):
-            try:
-                future.result()
-            except Exception as e:
-                print(f"Worker error ({futures[future]}): {e}")
-
-    
-def single_date_add_daymet_precip(args):
-    training_df_path, precip_data_path, geofile, precip_df_path, WY, dataset = args
-    #get date information
-    date = geofile.split('_')[-1].split('.parquet')[0]
-    region = geofile.split('_')[-2]
-    region_date = f"{region}_{date}"
-    year = date[:4]
-    mon = date[4:6]
-    day = date[6:]
-    strdate = f"{year}-{mon}-{day}"
-    print(f"Connecting precipitation to ASO observations for {WY} on {strdate} at {region}")
-    
-    if dataset == 'Daymet':
-        var = 'Daymet'
-    elif dataset == 'gridMET':
-        var = 'gridMET'
-    elif dataset == 'NLDAS':
-        var = 'NLDAS'
-    elif dataset == 'AORC':
-        var = 'AORC'
-    else:
-        raise ValueError("dataset not recognized") 
-    
-    GDF = pd.read_parquet(os.path.join(training_df_path, geofile))
-
-    # find the matching precip file
-    pptfiles = [filename for filename in os.listdir(precip_data_path) if filename.endswith('.parquet')]
-    ppt_filename = [filename for filename in pptfiles if region_date in filename]
-    if not ppt_filename:
-        print(f"No precip file found for {region_date}, skipping.")
-        return
-    ppt = pd.read_parquet(f"{precip_data_path}/{ppt_filename[0]}")
-
-    # vectorized join on cell_id
-    GDF = GDF.merge(
-        ppt[['cell_id', 'season_precip_cm']].rename(columns={'season_precip_cm': var}),
-        on='cell_id', how='left'
+def _bbox_from_centroids(centroids, pad=0.1):
+    """Return (left, right, bottom, top) bounding box with padding."""
+    return (
+        centroids['cen_lon'].min() - pad,
+        centroids['cen_lon'].max() + pad,
+        centroids['cen_lat'].min() - pad,
+        centroids['cen_lat'].max() + pad,
     )
-    GDF[var] = GDF[var].round(1).fillna(0.0)
-    
-    #Convert DataFrame to Apache Arrow Table
-    table = pa.Table.from_pandas(GDF)
-    # Parquet with Brotli compression
-    pq.write_table(table, f"{precip_df_path}/{dataset}_{geofile}", compression='BROTLI')
-#          
 
 
-def get_precip(WY,output_res,thresh,dataset):
-    # get precip by grabbing bounding box from previous training DF for basin + date
-    # set start date for precip obs to Oct 1 of previous year
-    valid = ['daymet','gridmet','nldas']
-    if dataset.lower() not in valid:
-        raise ValueError("dataset must be one of %r." % valid)
-    if dataset.lower() == 'daymet':
-        dataset = 'Daymet'
-    elif dataset.lower() == 'nldas':
-        dataset = 'NLDAS'
-    elif dataset.lower() == 'gridmet':
-        dataset = 'gridMET'
-        
-    WY_start = datetime(WY-1, 10, 1)
-    obs_start = WY_start.strftime('%Y-%m-%d')
-    print("Water Year start date:",obs_start)
-    
-    # select basins, dates by training DF
-    training_df_dir = f"{HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/VIIRSGeoObsDFs/{thresh}_fSCA_Thresh"
-    files = [filename for filename in os.listdir(training_df_dir)
-             if filename.endswith(".parquet")
-            ]
-    # print(files)
-    for file in tqdm(files, desc="Processing precip files"):
-        filepath = f'{training_df_dir}/{file}'
-        #Get timestamp
-        timestamp = file.split('_')[-1].split('.')[0]
-        #Get region
-        region = file.split('_')[-2]
-        # print(timestamp,region)
-        obs_end = f'{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:]}'
+def _precip_phase(precip, T_C, RH):
+    """
+    Jennings et al. (2018) binary phase partition.
+    Returns (snow, rain) as float32 arrays in same units as precip.
+    """
+    P_snow = 1.0 / (1.0 + np.exp(-10.04 + 1.41 * T_C + 0.09 * RH))
+    snow = np.where(P_snow >= 0.5, precip, 0.0).astype(np.float32)
+    rain = np.where(P_snow < 0.5,  precip, 0.0).astype(np.float32)
+    return snow, rain
 
-        # check to see if precip data already downloaded, if not, then download
-        precip_data_path = f"{HOME}/data/Precipitation/{WY}/{output_res}M_{dataset}_Precip"
-        if not os.path.exists(precip_data_path):
-            os.makedirs(precip_data_path, exist_ok=True)
-        if not os.path.exists(f"{precip_data_path}/{dataset}_{region}_{timestamp}.parquet"):
-        
-            print(f"Getting precipitation data for {obs_end} at {region}")
-            
-            training_df = pd.read_parquet(filepath)
-            # get bounding box by min/max coordinates
-            left, right = training_df['cen_lon'].min(), training_df['cen_lon'].max()
-            bottom, top = training_df['cen_lat'].min(), training_df['cen_lat'].max()
-            # add some padding to bbox
-            left -= 0.1
-            bottom -= 0.1
-            right += 0.1
-            top += 0.1
-            bbox = rasterio.coords.BoundingBox(left, bottom, right, top)
-            # print(bbox)    
-    
-            # get precip from appropriate server from beginning of WY through observation date and reproject
-            if dataset == 'Daymet':
-                var = "prcp"
-                obs_precip = daymet.get_bygeom(bbox,dates=(obs_start,obs_end),variables=var,crs="epsg:4326")
-            elif dataset == 'gridMET':
-                var = 'pr'
-                obs_precip = gridmet.get_bygeom(bbox,dates=(obs_start,obs_end),variables=var,crs="epsg:4326")
-            elif dataset == 'NLDAS':
-                var = "prcp"
-                obs_precip = nldas.get_bygeom(bbox,obs_start,obs_end,variables=var,geo_crs=4326)
-            obs_precip_transformed = obs_precip.rio.reproject(rasterio.crs.CRS.from_epsg('4326'))   
-            
-            # extract metadata
-            meta = training_df[['cell_id','cen_lat','cen_lon']]
-            lats = xr.DataArray(meta['cen_lat'].values, dims='points')
-            lons = xr.DataArray(meta['cen_lon'].values, dims='points')
-            try:
-                prcp_all = obs_precip_transformed[var].sel(x=lons, y=lats, method='nearest')
-                raw_vals = prcp_all.values  # shape (time, npoints)
-                season_precip_cm = np.round(raw_vals.sum(axis=0) / 10, 2)
-            finally:
-                obs_precip_transformed.close()
-            precip_df = pd.DataFrame({
-                'cell_id': meta['cell_id'].values,
-                'cen_lat': meta['cen_lat'].values,
-                'cen_lon': meta['cen_lon'].values,
-                'precip': list(raw_vals.T),
-                'season_precip_cm': season_precip_cm,
+
+def _rh_from_q_p(q, P_hPa, T_C):
+    """Relative humidity (%) from specific humidity, pressure (hPa), and temperature (C)."""
+    es = 6.112 * np.exp(17.67 * T_C / (T_C + 243.5))
+    e  = q * P_hPa / (0.622 + 0.378 * q)
+    return np.clip(e / es * 100.0, 0.0, 100.0)
+
+
+def _rh_from_dew(T_C, Td_C):
+    """Relative humidity (%) from temperature and dew-point temperature (Magnus formula)."""
+    es = 6.112 * np.exp(17.67 * T_C  / (T_C  + 243.5))
+    ed = 6.112 * np.exp(17.67 * Td_C / (Td_C + 243.5))
+    return np.clip(ed / es * 100.0, 0.0, 100.0)
+
+
+# gridMET
+
+_GRIDMET_FETCH_VARS = ['pr', 'tmmx', 'tmmn', 'rmax', 'rmin', 'srad']
+
+
+def _open_gridmet_var(var, year, lat_slice, lon_slice):
+    """Open one gridMET variable for one calendar year from THREDDS OPeNDAP."""
+    url = THREDDS_BASE.format(var=var, year=year)
+    ds_v = xr.open_dataset(url, engine='netcdf4')
+    lat_dim = 'latitude' if 'latitude' in ds_v.dims else 'lat'
+    spatial = [v for v in ds_v.data_vars if lat_dim in ds_v[v].dims]
+    if not spatial:
+        raise KeyError(f"No spatial variable found in {var} CY{year}")
+    da = ds_v[spatial[0]]
+    rename = {}
+    if 'latitude'  in da.dims:
+        rename['latitude']  = 'lat'
+    if 'longitude' in da.dims:
+        rename['longitude'] = 'lon'
+    if 'day'       in da.dims:
+        rename['day']       = 'time'
+    if rename:
+        da = da.rename(rename)
+    lat_vals = da.lat.values
+    lat_s = lat_slice if lat_vals[0] < lat_vals[-1] else slice(lat_slice.stop, lat_slice.start)
+    return da.sel(lat=lat_s, lon=lon_slice)
+
+
+def add_gridmet_df(WY, output_res, threshold):
+    """
+    Stream gridMET daily forcings from THREDDS OPeNDAP, extract at ASO centroid points,
+    apply Jennings (2018) binary phase partition, and add season-to-date met features
+    to each training DF. No intermediate zarr is written.
+
+    Reads from: Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh
+    Writes to:  gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh
+
+    New columns:
+        gridMET_precip  - season-to-date total precipitation (mm)
+        gridMET_snow    - season-to-date snow via Jennings (2018) (mm)
+        gridMET_rain    - season-to-date rain via Jennings (2018) (mm)
+        gridMET_APDD    - accumulated positive degree-days since Oct 1 (deg C days)
+        gridMET_T7d     - 7-day mean air temperature ending on obs date (deg C)
+        gridMET_T14d    - 14-day mean air temperature ending on obs date (deg C)
+        gridMET_SW7d    - 7-day mean shortwave radiation ending on obs date (W/m^2)
+        gridMET_SW14d   - 14-day mean shortwave radiation ending on obs date (W/m^2)
+    """
+    training_df_path = (
+        f"{HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/"
+        f"Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
+    )
+    df_path = (
+        f"{HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/"
+        f"gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
+    )
+    os.makedirs(df_path, exist_ok=True)
+
+    WY_start = f"{WY-1}-10-01"
+    WY_end   = f"{WY}-09-30"
+
+    centroids = _collect_centroids(training_df_path)
+    left, right, bottom, top = _bbox_from_centroids(centroids)
+    print(f"gridMET WY{WY}: {len(centroids)} unique centroids, "
+          f"bbox lon [{left:.2f}, {right:.2f}] lat [{bottom:.2f}, {top:.2f}]")
+
+    lat_slice = slice(bottom, top)
+    lon_slice = slice(left, right)
+
+    parts = []
+    for cy in (WY - 1, WY):
+        print(f"  Loading gridMET CY{cy}...")
+        var_das = {var: _open_gridmet_var(var, cy, lat_slice, lon_slice)
+                   for var in _GRIDMET_FETCH_VARS}
+        parts.append(xr.Dataset(var_das))
+
+    ds_bbox = xr.concat(parts, dim='time').sel(time=slice(WY_start, WY_end)).load()
+    print("  Extracting at centroid points...")
+
+    # vectorized nearest-neighbor extraction at all centroid points
+    lats_da = xr.DataArray(centroids['cen_lat'].values, dims='cell_id')
+    lons_da = xr.DataArray(centroids['cen_lon'].values, dims='cell_id')
+
+    tmean_k = ((ds_bbox['tmmx'] + ds_bbox['tmmn']) / 2.0).sel(
+        lat=lats_da, lon=lons_da, method='nearest').values.astype(np.float32)
+    rmean   = np.clip(((ds_bbox['rmax'] + ds_bbox['rmin']) / 2.0).sel(
+        lat=lats_da, lon=lons_da, method='nearest').values, 0.0, 100.0).astype(np.float32)
+    pr      = ds_bbox['pr'].sel(
+        lat=lats_da, lon=lons_da, method='nearest').values.astype(np.float32)
+    srad    = ds_bbox['srad'].sel(
+        lat=lats_da, lon=lons_da, method='nearest').values.astype(np.float32)
+    time_idx = ds_bbox.time.values
+    del ds_bbox
+
+    T_C = (tmean_k - 273.15).astype(np.float32)
+    snow, rain = _precip_phase(pr, T_C, rmean)
+
+    # in-memory (time, cell_id) dataset for per-file lookup
+    ds_all = xr.Dataset(
+        {
+            'pr':    xr.DataArray(pr,      dims=('time', 'cell_id')),
+            'tmean': xr.DataArray(tmean_k, dims=('time', 'cell_id')),
+            'srad':  xr.DataArray(srad,    dims=('time', 'cell_id')),
+            'SNOW':  xr.DataArray(snow,    dims=('time', 'cell_id')),
+            'RAIN':  xr.DataArray(rain,    dims=('time', 'cell_id')),
+        },
+        coords={'time': time_idx, 'cell_id': centroids['cell_id'].values},
+    )
+
+    training_dfs = [f for f in os.listdir(training_df_path) if f.endswith('.parquet')]
+
+    for geofile in tqdm(training_dfs, desc=f"Adding gridMET features WY{WY}"):
+        date    = geofile.split('_')[-1].split('.parquet')[0]
+        region  = geofile.split('_')[-2]
+        strdate = f"{date[:4]}-{date[4:6]}-{date[6:]}"
+        print(f"  gridMET -> {region} {strdate}")
+
+        GDF      = pd.read_parquet(os.path.join(training_df_path, geofile))
+        df_cells = GDF['cell_id'].values
+        GDF.set_index('cell_id', inplace=True)
+
+        ds_sl  = ds_all.sel(time=slice(WY_start, strdate), cell_id=df_cells)
+        T_C_sl = ds_sl['tmean'].values - 273.15
+        SW_sl  = ds_sl['srad'].values
+
+        GDF['gridMET_precip'] = np.round(ds_sl['pr'].values.sum(axis=0),    2)
+        GDF['gridMET_snow']   = np.round(ds_sl['SNOW'].values.sum(axis=0),  2)
+        GDF['gridMET_rain']   = np.round(ds_sl['RAIN'].values.sum(axis=0),  2)
+        GDF['gridMET_APDD']   = np.round(np.maximum(T_C_sl, 0).sum(axis=0), 2)
+        GDF['gridMET_T7d']    = np.round(T_C_sl[-7:].mean(axis=0),          2)
+        GDF['gridMET_T14d']   = np.round(T_C_sl[-14:].mean(axis=0),         2)
+        GDF['gridMET_SW7d']   = np.round(SW_sl[-7:].mean(axis=0),           2)
+        GDF['gridMET_SW14d']  = np.round(SW_sl[-14:].mean(axis=0),          2)
+
+        GDF.reset_index(inplace=True)
+        table = pa.Table.from_pandas(GDF)
+        pq.write_table(table, f"{df_path}/gridMET_{geofile}", compression='BROTLI')
+
+
+# NLDAS
+
+def _nldas_url(dt):
+    return (
+        f"{NLDAS_BASE}/{dt.year}/{dt.day_of_year:03d}"
+        f"/NLDAS_FORA0125_H.A{dt.strftime('%Y%m%d')}.{dt.hour:02d}00.020.nc"
+    )
+
+
+def _fetch_nldas_file(args):
+    session, url = args
+    for attempt in range(5):
+        try:
+            r = session.get(url, timeout=120)
+            r.raise_for_status()
+            return io.BytesIO(r.content)
+        except Exception:
+            if attempt < 4:
+                time_module.sleep(2 ** attempt)
+    return None
+
+
+def _load_nldas_month(session, hours, n_workers=8):
+    """
+    Download hourly NLDAS files for one month in parallel.
+    Missing hours are filled with NaN rather than skipping the month.
+    Returns an xr.Dataset with NLDAS_VARS, loaded into memory.
+    """
+    urls = [_nldas_url(dt) for dt in hours]
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        buffers = list(ex.map(_fetch_nldas_file, [(session, u) for u in urls]))
+
+    n_failed = sum(b is None for b in buffers)
+    if n_failed == len(buffers):
+        raise RuntimeError("All hourly NLDAS files failed after retries")
+    if n_failed > 0:
+        print(f"    {n_failed}/{len(buffers)} files failed; filling with NaN")
+
+    first_good = next(i for i, b in enumerate(buffers) if b is not None)
+    template   = xr.open_dataset(buffers[first_good], engine='h5netcdf')[NLDAS_VARS].load()
+
+    datasets = []
+    for i, (buf, dt) in enumerate(zip(buffers, hours)):
+        if i == first_good:
+            datasets.append(template)
+        elif buf is not None:
+            datasets.append(xr.open_dataset(buf, engine='h5netcdf')[NLDAS_VARS].load())
+        else:
+            nan_ds = xr.Dataset({
+                v: xr.DataArray(
+                    np.full(template[v].squeeze().shape, np.nan, dtype=np.float32),
+                    dims=[d for d in template[v].dims if d != 'time'],
+                    coords={d: template[d] for d in template[v].dims if d != 'time'},
+                ).expand_dims({'time': np.array([np.datetime64(dt.to_datetime64())], dtype='datetime64[ns]')})
+                for v in NLDAS_VARS
             })
-            
-            # save raw data for each basin and date
-                
-            table = pa.Table.from_pandas(precip_df)
-            pq.write_table(table, f"{precip_data_path}/{dataset}_{region}_{timestamp}.parquet", compression='BROTLI')
-       
-### next set of PRISM functions are adapted from Yen Yi Wu via CUAHSI - thank you! 
+            datasets.append(nan_ds)
+
+    ds = xr.concat(datasets, dim='time').load()
+    for d in datasets:
+        d.close()
+    del buffers
+    return ds
+
+
+def get_nldas_wy_daily(WY, output_res, thresh, save_path=None, n_workers=8):
+    """
+    Download hourly NLDAS-2 FORA data for a water year via authenticated HTTPS (GES DISC),
+    extract at ASO centroid points, apply Jennings (2018) binary phase partition at the
+    hourly timestep, aggregate to daily, and save as a (time, cell_id) zarr.
+
+    Requires Earthdata credentials in ~/.netrc (machine urs.earthdata.nasa.gov).
+
+    Saved variables:
+        Rainf   - daily precipitation sum (mm/day)
+        Tair    - daily mean air temperature (K)
+        SWdown  - daily mean shortwave radiation (W/m^2)
+        SNOW    - Jennings (2018) binary snow daily sum (mm/day)
+        RAIN    - Jennings (2018) binary rain daily sum (mm/day)
+    """
+    if save_path is None:
+        save_path = os.path.join(
+            HOME, "data", "Precipitation", str(WY), "NLDAS", f"NLDAS_daily_WY{WY}.zarr"
+        )
+
+    if os.path.exists(save_path):
+        print(f"NLDAS daily WY{WY} already exists at {save_path}")
+        return xr.open_zarr(save_path)
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    viirs_dir = (
+        f"{HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/"
+        f"VIIRSGeoObsDFs/{thresh}_fSCA_Thresh"
+    )
+    centroids = _collect_centroids(viirs_dir)
+    left, right, bottom, top = _bbox_from_centroids(centroids)
+    print(f"NLDAS WY{WY}: {len(centroids)} unique centroids, "
+          f"bbox lon [{left:.2f}, {right:.2f}] lat [{bottom:.2f}, {top:.2f}]")
+
+    lats_da = xr.DataArray(centroids['cen_lat'].values, dims='cell_id')
+    lons_da = xr.DataArray(centroids['cen_lon'].values, dims='cell_id')
+
+    earthaccess.login(strategy='netrc')
+    session = earthaccess.get_requests_https_session()
+
+    wy_start_ts = pd.Timestamp(WY - 1, 10, 1)
+    wy_end_ts   = pd.Timestamp(WY, 9, 30, 23, 59, 59)
+
+    times = []
+    accum = {v: [] for v in ['Rainf', 'Tair', 'SWdown', 'SNOW', 'RAIN']}
+
+    for m_start in pd.date_range(wy_start_ts, wy_end_ts, freq='MS'):
+        m_end = min(m_start + pd.offsets.MonthEnd(0) + pd.Timedelta(hours=23), wy_end_ts)
+        hours = pd.date_range(m_start, m_end, freq='h')
+        print(f"  NLDAS {m_start.strftime('%Y-%m')}: downloading {len(hours)} hourly files...")
+
+        try:
+            ds_hr = _load_nldas_month(session, hours, n_workers=n_workers)
+        except RuntimeError as e:
+            print(f"  Skipping {m_start.strftime('%Y-%m')}: {e}")
+            continue
+
+        rename = {}
+        if 'latitude'  in ds_hr.dims:
+            rename['latitude']  = 'lat'
+        if 'longitude' in ds_hr.dims:
+            rename['longitude'] = 'lon'
+        if rename:
+            ds_hr = ds_hr.rename(rename)
+
+        # clip to bbox
+        lat_vals = ds_hr.lat.values
+        lat_s    = slice(bottom, top) if lat_vals[0] < lat_vals[-1] else slice(top, bottom)
+        ds_hr    = ds_hr.sel(lat=lat_s, lon=slice(left, right))
+
+        # extract at centroid points: (n_hours, n_cells)
+        ds_pts = ds_hr.sel(lat=lats_da, lon=lons_da, method='nearest')
+        ds_hr.close()
+
+        # hourly phase partition
+        rainf    = ds_pts['Rainf'].values.astype(np.float32)
+        tair     = ds_pts['Tair'].values.astype(np.float32)
+        qair     = ds_pts['Qair'].values.astype(np.float32)
+        psurf    = ds_pts['PSurf'].values.astype(np.float32)
+        T_C_hr   = tair - 273.15
+        RH_hr    = _rh_from_q_p(qair, psurf / 100.0, T_C_hr)
+        snow_hr, rain_hr = _precip_phase(rainf, T_C_hr, RH_hr)
+
+        dims_hr   = ds_pts['Rainf'].dims
+        coords_hr = ds_pts['Rainf'].coords
+        ds_ext = ds_pts.assign({
+            'SNOW': xr.DataArray(snow_hr, dims=dims_hr, coords=coords_hr),
+            'RAIN': xr.DataArray(rain_hr, dims=dims_hr, coords=coords_hr),
+        })
+
+        daily = xr.merge([
+            ds_ext[['Rainf', 'SNOW', 'RAIN']].resample(time='1D').sum(min_count=1),
+            ds_pts[['Tair', 'SWdown']].resample(time='1D').mean(),
+        ]).load()
+        ds_ext.close()
+        ds_pts.close()
+
+        times.append(daily.time.values)
+        for v in accum:
+            accum[v].append(daily[v].values.astype(np.float32))
+        daily.close()
+
+    if not times:
+        raise RuntimeError(f"No NLDAS data downloaded for WY{WY}")
+
+    time_arr = np.concatenate(times)
+    cell_ids = centroids['cell_id'].values
+    ds_out = xr.Dataset(
+        {v: xr.DataArray(np.concatenate(accum[v], axis=0), dims=('time', 'cell_id'))
+         for v in accum},
+        coords={'time': time_arr, 'cell_id': cell_ids},
+    )
+
+    ds_out = ds_out.chunk({'time': 30, 'cell_id': len(cell_ids)})
+    print(f"Saving NLDAS daily zarr for WY{WY} to {save_path} ...")
+    ds_out.to_zarr(save_path, mode='w', consolidated=True)
+    print("Done.")
+    return xr.open_zarr(save_path)
+
+
+def add_nldas_df(WY, output_res, threshold):
+    """
+    Add season-to-date NLDAS met features to each training DF from the (time, cell_id) zarr.
+
+    Reads from: gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh
+    Writes to:  NLDAS_gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh
+
+    New columns:
+        NLDAS_precip  - season-to-date total precipitation (mm)
+        NLDAS_snow    - season-to-date snow via Jennings (2018) (mm)
+        NLDAS_rain    - season-to-date rain via Jennings (2018) (mm)
+        NLDAS_APDD    - accumulated positive degree-days since Oct 1 (deg C days)
+        NLDAS_T7d     - 7-day mean air temperature ending on obs date (deg C)
+        NLDAS_T14d    - 14-day mean air temperature ending on obs date (deg C)
+        NLDAS_SW7d    - 7-day mean shortwave radiation ending on obs date (W/m^2)
+        NLDAS_SW14d   - 14-day mean shortwave radiation ending on obs date (W/m^2)
+    """
+    training_df_path = (
+        f"{HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/"
+        f"gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
+    )
+    df_path = (
+        f"{HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/"
+        f"NLDAS_gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
+    )
+    os.makedirs(df_path, exist_ok=True)
+
+    zarr_path = os.path.join(
+        HOME, "data", "Precipitation", str(WY), "NLDAS", f"NLDAS_daily_WY{WY}.zarr"
+    )
+    if not os.path.exists(zarr_path):
+        raise FileNotFoundError(
+            f"NLDAS zarr not found at {zarr_path}. Run get_nldas_wy_daily() first."
+        )
+
+    ds_nl    = xr.open_zarr(zarr_path)
+    WY_start = f"{WY-1}-10-01"
+    training_dfs = [f for f in os.listdir(training_df_path) if f.endswith('.parquet')]
+
+    for geofile in tqdm(training_dfs, desc=f"Adding NLDAS features WY{WY}"):
+        date    = geofile.split('_')[-1].split('.parquet')[0]
+        region  = geofile.split('_')[-2]
+        strdate = f"{date[:4]}-{date[4:6]}-{date[6:]}"
+        print(f"  NLDAS -> {region} {strdate}")
+
+        GDF      = pd.read_parquet(os.path.join(training_df_path, geofile))
+        df_cells = GDF['cell_id'].values
+        GDF.set_index('cell_id', inplace=True)
+
+        ds_sl = ds_nl.sel(time=slice(WY_start, strdate), cell_id=df_cells)
+        T_C   = ds_sl['Tair'].values - 273.15
+        SW    = ds_sl['SWdown'].values
+
+        GDF['NLDAS_precip'] = np.round(ds_sl['Rainf'].values.sum(axis=0), 2)
+        GDF['NLDAS_snow']   = np.round(ds_sl['SNOW'].values.sum(axis=0),  2)
+        GDF['NLDAS_rain']   = np.round(ds_sl['RAIN'].values.sum(axis=0),  2)
+        GDF['NLDAS_APDD']   = np.round(np.maximum(T_C, 0).sum(axis=0),    2)
+        GDF['NLDAS_T7d']    = np.round(T_C[-7:].mean(axis=0),             2)
+        GDF['NLDAS_T14d']   = np.round(T_C[-14:].mean(axis=0),            2)
+        GDF['NLDAS_SW7d']   = np.round(SW[-7:].mean(axis=0),              2)
+        GDF['NLDAS_SW14d']  = np.round(SW[-14:].mean(axis=0),             2)
+
+        GDF.reset_index(inplace=True)
+        table = pa.Table.from_pandas(GDF)
+        pq.write_table(table, f"{df_path}/NLDAS_{geofile}", compression='BROTLI')
+
+    ds_nl.close()
+
+
+# PRISM
+
 def _progress_hook(block_num, block_size, total_size, t):
-    """
-    Callback function to update tqdm progress bar during file download.
-    """
     downloaded = block_num * block_size
     if total_size > 0:
         t.update(min(block_size, total_size - t.n))
     else:
         t.update(downloaded - t.n)
 
-def prism_download(start,stop,path,var):
-    base_url = "https://services.nacse.org/prism/data/get/us/4km/"
+
+def _prism_download_days(start, stop, path, var):
+    """Download daily PRISM zip files for one variable between start and stop (inclusive)."""
+    base_url = "https://services.nacse.org/prism/data/get/us/800m/"
     while start <= stop:
         day = start.strftime("%Y%m%d")
         url = f"{base_url}/{var}/{day}?format=nc"
-        output_file = os.path.join(path, day)
-
-        with tqdm(unit='B', unit_scale=True, unit_divisor=1024, miniters=1, desc=f'Downloading {day}') as t:
-            urllib.request.urlretrieve(url, output_file, reporthook=lambda block_num, block_size, total_size: _progress_hook(block_num, block_size, total_size, t))
-
+        out_file = os.path.join(path, day)
+        if not os.path.exists(out_file):
+            with tqdm(unit='B', unit_scale=True, unit_divisor=1024, miniters=1,
+                      desc=f'Downloading {var} {day}') as t:
+                urllib.request.urlretrieve(
+                    url, out_file,
+                    reporthook=lambda bn, bs, ts: _progress_hook(bn, bs, ts, t)
+                )
         start += timedelta(days=1)
 
-def unzip_prism(start,stop,zipped_path,unzipped_path):
+
+def _prism_unzip(start, stop, zipped_path, unzipped_path):
     while start <= stop:
         day = start.strftime("%Y%m%d")
-        zip_file_path = os.path.join(zipped_path, day)
-
-        # Check if the ZIP file exists
-        if os.path.exists(zip_file_path):
-            # Unzip the file
-            with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-                zip_ref.extractall(unzipped_path)
-                print(f"UNZIP file for {day} is completed.")
-            os.remove(zip_file_path)
-        else:
-            print(f"ZIP file for {day} not found.")
-
+        zip_file = os.path.join(zipped_path, day)
+        if os.path.exists(zip_file):
+            with zipfile.ZipFile(zip_file, 'r') as zf:
+                zf.extractall(unzipped_path)
+            os.remove(zip_file)
         start += timedelta(days=1)
 
-def get_prism(WY):
-    prism_path = f'{HOME}/data/Precipitation/{WY}/prism_data'
-    zipped_path = f'{prism_path}/zipped'
-    unzipped_path = f'{prism_path}/unzipped'
-    os.makedirs(zipped_path,exist_ok=True)
-    os.makedirs(unzipped_path,exist_ok=True)
 
-    var = "ppt"
+def get_prism(WY, vars=None):
+    """
+    Download PRISM 800m daily data for the given variables and water year.
+    Saves one NC file per variable: data/Precipitation/{WY}/prism_data/{WY}_{var}.nc
+    """
+    if vars is None:
+        vars = ['ppt', 'tmean', 'tdmean']
+    if isinstance(vars, str):
+        vars = [vars]
+    prism_path = f'{HOME}/data/Precipitation/{WY}/prism_800m'
     start = datetime.strptime(f"{WY-1}-10-01", "%Y-%m-%d")
-    stop = datetime.strptime(f"{WY}-09-30", "%Y-%m-%d")
+    stop  = datetime.strptime(f"{WY}-09-30",   "%Y-%m-%d")
+    date_idx = pd.Index(pd.date_range(start=start, end=stop), name='time')
 
-    if not os.path.exists(f'{prism_path}/{WY}.nc'):
-        prism_download(start,stop,zipped_path,var)
-        unzip_prism(start,stop,zipped_path,unzipped_path)
+    for var in vars:
+        out_nc = f'{prism_path}/{WY}_{var}.nc'
+        if os.path.exists(out_nc):
+            print(f"PRISM {var} WY{WY} already exists")
+            continue
 
-        date_idx = pd.Index(pd.date_range(start=start,end=stop),name='time')
-        timeser = xr.open_mfdataset(f'{unzipped_path}/*.nc', 
-                                        combine='nested',
-                                        concat_dim=[date_idx,]
-                                        )
-        timeser.to_netcdf(path=f'{prism_path}/{WY}.nc')
-    else:
-        print(f'PRISM data already downloaded for {WY}')
+        zipped_path   = f'{prism_path}/zipped_{var}'
+        unzipped_path = f'{prism_path}/unzipped_{var}'
+        os.makedirs(zipped_path,   exist_ok=True)
+        os.makedirs(unzipped_path, exist_ok=True)
 
-def add_prism_df(WY,output_res,threshold):
+        _prism_download_days(start, stop, zipped_path, var)
+        _prism_unzip(start, stop, zipped_path, unzipped_path)
 
-    training_df_path = f"{HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/AORCgridMETNLDASDaymet_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
-    df_path = f"{HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/PRISM_AORCgridMETNLDASDaymet_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
-    os.makedirs(df_path,exist_ok=True)
-    
-    training_dfs = [filename for filename in os.listdir(training_df_path) if filename.endswith('.parquet')]
+        ds = xr.open_mfdataset(
+            f'{unzipped_path}/*.nc',
+            combine='nested',
+            concat_dim=[date_idx],
+        )
+        ds.to_netcdf(out_nc)
+        ds.close()
+        print(f"Saved PRISM {var} WY{WY} -> {out_nc}")
 
-    obs_precip = xr.open_dataset(f'{HOME}/data/Precipitation/{WY}/prism_data/{WY}.nc')
-    # reproject to WGS84
-    obs_precip = obs_precip.rio.write_crs('EPSG:4269')
-    obs_precip_transformed = obs_precip.rio.reproject(rasterio.crs.CRS.from_epsg('4326'))   
+
+def add_prism_df(WY, output_res, threshold):
+    """
+    Add season-to-date PRISM precipitation, phase-partitioned snow/rain,
+    and ablation features to each training DF.
+
+    Reads from: AORC_NLDAS_gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh
+    Writes to:  PRISM_AORC_NLDAS_gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh
+
+    Requires PRISM NC files from get_prism(WY, vars=['ppt', 'tmean', 'tdmean']).
+
+    New columns:
+        PRISM_precip  - season-to-date total precipitation (mm)
+        PRISM_snow    - season-to-date snow via Jennings (2018) (mm)
+        PRISM_rain    - season-to-date rain via Jennings (2018) (mm)
+        PRISM_APDD    - accumulated positive degree-days since Oct 1 (deg C days)
+        PRISM_T7d     - 7-day mean air temperature ending on obs date (deg C)
+        PRISM_T14d    - 14-day mean air temperature ending on obs date (deg C)
+    """
+    training_df_path = (
+        f"{HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/"
+        f"AORC_NLDAS_gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
+    )
+    df_path = (
+        f"{HOME}/data/TrainingDFs/{WY}/{output_res}M_Resolution/"
+        f"PRISM_AORC_NLDAS_gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh"
+    )
+    os.makedirs(df_path, exist_ok=True)
+
+    prism_path = f'{HOME}/data/Precipitation/{WY}/prism_800m'
+    for var in ('ppt', 'tmean', 'tdmean'):
+        nc_path = f'{prism_path}/{WY}_{var}.nc'
+        if not os.path.exists(nc_path):
+            raise FileNotFoundError(
+                f"PRISM {var} NC not found at {nc_path}. "
+                f"Run get_prism({WY}, vars=['ppt','tmean','tdmean']) first."
+            )
+
+    # load full WY datasets and reproject to WGS84
+    ppt_ds    = xr.open_dataset(f'{prism_path}/{WY}_ppt.nc').rio.write_crs('EPSG:4269').rio.reproject('EPSG:4326')
+    tmean_ds  = xr.open_dataset(f'{prism_path}/{WY}_tmean.nc').rio.write_crs('EPSG:4269').rio.reproject('EPSG:4326')
+    tdmean_ds = xr.open_dataset(f'{prism_path}/{WY}_tdmean.nc').rio.write_crs('EPSG:4269').rio.reproject('EPSG:4326')
+
+    y_desc = ppt_ds.y.values[0] > ppt_ds.y.values[-1]
+    x_asc  = ppt_ds.x.values[0] < ppt_ds.x.values[-1]
 
     WY_start = f'{WY-1}-10-01'
+    training_dfs = [f for f in os.listdir(training_df_path) if f.endswith('.parquet')]
 
-    for geofile in tqdm(training_dfs, desc="Processing PRISM files"):
-        #get date information
-        date = geofile.split('_')[-1].split('.parquet')[0]
-        region = geofile.split('_')[-2]
-        year = date[:4]
-        mon = date[4:6]
-        day = date[6:]
-        strdate = f"{year}-{mon}-{day}"
-        print(f"Connecting PRISM precipitation to ASO observations on {strdate} at {region}")
+    for geofile in tqdm(training_dfs, desc=f"Adding PRISM features WY{WY}"):
+        date    = geofile.split('_')[-1].split('.parquet')[0]
+        region  = geofile.split('_')[-2]
+        strdate = f"{date[:4]}-{date[4:6]}-{date[6:]}"
+        print(f"  PRISM -> {region} {strdate}")
 
-        # read training DF and add column for PRISM season precip
-        GDF = pd.read_parquet(os.path.join(training_df_path, geofile))
-        meta = GDF[['cell_id','cen_lat','cen_lon']]
+        GDF  = pd.read_parquet(os.path.join(training_df_path, geofile))
+        meta = GDF[['cell_id', 'cen_lat', 'cen_lon']]
         GDF.set_index('cell_id', inplace=True)
 
-        # get bbox from training DF
-        left, right = meta['cen_lon'].min(), meta['cen_lon'].max()
-        bottom, top = meta['cen_lat'].min(), meta['cen_lat'].max()
-        # add some padding to bbox
-        left -= 0.1
-        bottom -= 0.1
-        right += 0.1
-        top += 0.1
-        obs_precip_date = obs_precip_transformed.loc[dict(time=slice(WY_start,strdate))]
-        obs_precip_bbox = obs_precip_date.sel(y=slice(top, bottom), x=slice(left, right))
+        left   = meta['cen_lon'].min() - 0.1
+        right  = meta['cen_lon'].max() + 0.1
+        bottom = meta['cen_lat'].min() - 0.1
+        top    = meta['cen_lat'].max() + 0.1
+        y_s    = slice(top, bottom) if y_desc else slice(bottom, top)
+        x_s    = slice(left, right) if x_asc  else slice(right, left)
 
         lats = xr.DataArray(meta['cen_lat'].values, dims='points')
         lons = xr.DataArray(meta['cen_lon'].values, dims='points')
-        pr_all = obs_precip_bbox['Band1'].sel(x=lons, y=lats, method='nearest')
-        season_precip_arr = np.round(pr_all.values.sum(axis=0) / 10, 2)
-        obs_precip_bbox.close()
-        obs_precip_date.close()
 
-        GDF['PRISM'] = season_precip_arr
+        def _slice_pts(ds):
+            sliced = ds.loc[dict(time=slice(WY_start, strdate))].sel(y=y_s, x=x_s)
+            return sliced['Band1'].sel(x=lons, y=lats, method='nearest').values
+
+        ppt_vals    = _slice_pts(ppt_ds)    # mm
+        tmean_vals  = _slice_pts(tmean_ds)  # deg C
+        tdmean_vals = _slice_pts(tdmean_ds) # deg C
+
+        RH = _rh_from_dew(tmean_vals, tdmean_vals)
+        snow_arr, rain_arr = _precip_phase(ppt_vals, tmean_vals, RH)
+
+        GDF['PRISM_precip'] = np.round(ppt_vals.sum(axis=0),               2)
+        GDF['PRISM_snow']   = np.round(snow_arr.sum(axis=0),               2)
+        GDF['PRISM_rain']   = np.round(rain_arr.sum(axis=0),               2)
+        GDF['PRISM_APDD']   = np.round(np.maximum(tmean_vals, 0).sum(axis=0), 2)
+        GDF['PRISM_T7d']    = np.round(tmean_vals[-7:].mean(axis=0),       2)
+        GDF['PRISM_T14d']   = np.round(tmean_vals[-14:].mean(axis=0),      2)
+
         GDF.reset_index(inplace=True)
-
-        #Convert DataFrame to Apache Arrow Table
         table = pa.Table.from_pandas(GDF)
-        # Parquet with Brotli compression
         pq.write_table(table, f"{df_path}/PRISM_{geofile}", compression='BROTLI')
-    obs_precip_transformed.close()
-    
+
+    ppt_ds.close()
+    tmean_ds.close()
+    tdmean_ds.close()
