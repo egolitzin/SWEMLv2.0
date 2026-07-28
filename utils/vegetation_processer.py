@@ -13,6 +13,15 @@ import zipfile
 #set home directory
 HOME = os.getcwd()
 
+# NALCMS 2020 class groupings
+VEG_FLAGS = {
+    'veg_evergreen': list(range(1, 4)),    # 1-3: needleleaf/broadleaf evergreen
+    'veg_deciduous': list(range(4, 6)),    # 4-5: broadleaf deciduous
+    'veg_mixed':     [6],                  # 6: mixed forest
+    'veg_grassland': list(range(7, 14)),   # 7-13: shrubland/grassland/barren-lichen
+    # veg_other (14-19) is omitted; all-zero encodes wetland/barren/urban/water/ice
+}
+
 def get_data(url, output_path, file):
 
     if not os.path.exists(f"{output_path}/{file}"):
@@ -133,7 +142,9 @@ def process_vegetation_data_for_files(input_directory, vegetation_file, output_d
             cols = np.array(cols, dtype=np.int64)
 
             # Read only the window of the raster covering these points
-            current_df['vegetation_value'] = _sample_window(src, rows, cols)
+            raw = pd.Series(_sample_window(src, rows, cols))
+            for col, codes in VEG_FLAGS.items():
+                current_df[col] = raw.isin(codes).astype(int)
 
             output_file = os.path.join(output_directory, f"Vegetation_{parquet_file}")
             current_df.to_parquet(output_file)
