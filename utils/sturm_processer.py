@@ -12,6 +12,16 @@ import requests
 #set home directory
 HOME = os.getcwd()
 
+STURM_NAMES = {
+    1: 'tundra',
+    2: 'boreal',
+    3: 'maritime',
+    4: 'ephemeral',
+    5: 'prairie',
+    6: 'montane',
+    7: 'ice',
+}
+
 def get_Sturm_data():
 
     url = "https://daacdata.apps.nsidc.org/pub/DATASETS/nsidc0768_global_seasonal_snow_classification_v01/SnowClass_NA_300m_10.0arcsec_2021_v01.0.tif"
@@ -64,7 +74,7 @@ def process_sturm_data_for_files(input_directory, sturm_file, output_directory):
         print(f"Sturm file bounds: {sturm_bbox}")
     
     # Progress bar for overall processing
-    print('Adding Sturm snow classificaction to ASO gridcells')
+    print('Adding Sturm snow classification to ASO gridcells')
     for parquet_file in tqdm_notebook(parquet_files):
         input_file = os.path.join(input_directory, parquet_file)
         
@@ -85,8 +95,10 @@ def process_sturm_data_for_files(input_directory, sturm_file, output_directory):
         # Sample Sturm data at the centroid coordinates
         sturm_values = sample_sturm_data(sturm_file, centroid_coords)
 
-        # Add the sampled values to the Current GeoDataFrame
-        current_gdf['sturm_value'] = sturm_values
+        # Add one-hot Sturm class flags
+        sv = pd.Series(sturm_values)
+        for code, name in STURM_NAMES.items():
+            current_gdf[f'sturm_{name}'] = sv.eq(code).astype(int)
 
         # Define the output file path
         output_file = os.path.join(output_directory, f"Sturm_{parquet_file}")

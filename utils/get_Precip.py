@@ -286,8 +286,8 @@ def _load_nldas_month(session, hours, n_workers=8):
 def get_nldas_wy_daily(WY, output_res, thresh, save_path=None, n_workers=8):
     """
     Download hourly NLDAS-2 FORA data for a water year via authenticated HTTPS (GES DISC),
-    extract at ASO centroid points, apply Jennings (2018) binary phase partition at the
-    hourly timestep, aggregate to daily, and save as a (time, cell_id) zarr.
+    apply Jennings (2018) binary phase partition at the hourly timestep, aggregate to daily,
+    and save as a (time, lat, lon) zarr on the native NLDAS grid.
 
     Requires Earthdata credentials in ~/.netrc (machine urs.earthdata.nasa.gov).
 
@@ -303,9 +303,9 @@ def get_nldas_wy_daily(WY, output_res, thresh, save_path=None, n_workers=8):
             HOME, "data", "Precipitation", str(WY), "NLDAS", f"NLDAS_daily_WY{WY}.zarr"
         )
 
-    if os.path.exists(save_path):
-        print(f"NLDAS daily WY{WY} already exists at {save_path}")
-        return xr.open_zarr(save_path)
+    # if os.path.exists(save_path):
+    #     print(f"NLDAS daily WY{WY} already exists at {save_path}")
+    #     return xr.open_zarr(save_path)
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
@@ -315,11 +315,7 @@ def get_nldas_wy_daily(WY, output_res, thresh, save_path=None, n_workers=8):
     )
     centroids = _collect_centroids(viirs_dir)
     left, right, bottom, top = _bbox_from_centroids(centroids)
-    print(f"NLDAS WY{WY}: {len(centroids)} unique centroids, "
-          f"bbox lon [{left:.2f}, {right:.2f}] lat [{bottom:.2f}, {top:.2f}]")
-
-    lats_da = xr.DataArray(centroids['cen_lat'].values, dims='cell_id')
-    lons_da = xr.DataArray(centroids['cen_lon'].values, dims='cell_id')
+    print(f"NLDAS WY{WY}: bbox lon [{left:.2f}, {right:.2f}] lat [{bottom:.2f}, {top:.2f}]")
 
     earthaccess.login(strategy='netrc')
     session = earthaccess.get_requests_https_session()
@@ -327,8 +323,10 @@ def get_nldas_wy_daily(WY, output_res, thresh, save_path=None, n_workers=8):
     wy_start_ts = pd.Timestamp(WY - 1, 10, 1)
     wy_end_ts   = pd.Timestamp(WY, 9, 30, 23, 59, 59)
 
-    times = []
-    accum = {v: [] for v in ['Rainf', 'Tair', 'SWdown', 'SNOW', 'RAIN']}
+    times    = []
+    accum    = {v: [] for v in ['Rainf', 'Tair', 'SWdown', 'SNOW', 'RAIN']}
+    grid_lat = None
+    grid_lon = None
 
     for m_start in pd.date_range(wy_start_ts, wy_end_ts, freq='MS'):
         m_end = min(m_start + pd.offsets.MonthEnd(0) + pd.Timedelta(hours=23), wy_end_ts)
@@ -349,38 +347,37 @@ def get_nldas_wy_daily(WY, output_res, thresh, save_path=None, n_workers=8):
         if rename:
             ds_hr = ds_hr.rename(rename)
 
-        # clip to bbox
-        lat_vals = ds_hr.lat.values
-        lat_s    = slice(bottom, top) if lat_vals[0] < lat_vals[-1] else slice(top, bottom)
-        ds_hr    = ds_hr.sel(lat=lat_s, lon=slice(left, right))
+        # clip to domain bbox
+        lat_ord = ds_hr.lat.values
+        lat_s   = slice(bottom, top) if lat_ord[0] < lat_ord[-1] else slice(top, bottom)
+        ds_hr   = ds_hr.sel(lat=lat_s, lon=slice(left, right))
 
-        # extract at centroid points: (n_hours, n_cells)
-        ds_pts = ds_hr.sel(lat=lats_da, lon=lons_da, method='nearest')
-        ds_hr.close()
-
-        # hourly phase partition
-        rainf    = ds_pts['Rainf'].values.astype(np.float32)
-        tair     = ds_pts['Tair'].values.astype(np.float32)
-        qair     = ds_pts['Qair'].values.astype(np.float32)
-        psurf    = ds_pts['PSurf'].values.astype(np.float32)
-        T_C_hr   = tair - 273.15
-        RH_hr    = _rh_from_q_p(qair, psurf / 100.0, T_C_hr)
+        # hourly phase partition on native grid
+        rainf  = ds_hr['Rainf'].values.astype(np.float32)
+        tair   = ds_hr['Tair'].values.astype(np.float32)
+        qair   = ds_hr['Qair'].values.astype(np.float32)
+        psurf  = ds_hr['PSurf'].values.astype(np.float32)
+        T_C_hr = tair - 273.15
+        RH_hr  = _rh_from_q_p(qair, psurf / 100.0, T_C_hr)
         snow_hr, rain_hr = _precip_phase(rainf, T_C_hr, RH_hr)
 
-        dims_hr   = ds_pts['Rainf'].dims
-        coords_hr = ds_pts['Rainf'].coords
-        ds_ext = ds_pts.assign({
+        dims_hr   = ds_hr['Rainf'].dims
+        coords_hr = ds_hr['Rainf'].coords
+        ds_ext = ds_hr.assign({
             'SNOW': xr.DataArray(snow_hr, dims=dims_hr, coords=coords_hr),
             'RAIN': xr.DataArray(rain_hr, dims=dims_hr, coords=coords_hr),
         })
 
         daily = xr.merge([
             ds_ext[['Rainf', 'SNOW', 'RAIN']].resample(time='1D').sum(min_count=1),
-            ds_pts[['Tair', 'SWdown']].resample(time='1D').mean(),
+            ds_hr[['Tair', 'SWdown']].resample(time='1D').mean(),
         ]).load()
         ds_ext.close()
-        ds_pts.close()
+        ds_hr.close()
 
+        if grid_lat is None:
+            grid_lat = daily.lat.values
+            grid_lon = daily.lon.values
         times.append(daily.time.values)
         for v in accum:
             accum[v].append(daily[v].values.astype(np.float32))
@@ -390,14 +387,13 @@ def get_nldas_wy_daily(WY, output_res, thresh, save_path=None, n_workers=8):
         raise RuntimeError(f"No NLDAS data downloaded for WY{WY}")
 
     time_arr = np.concatenate(times)
-    cell_ids = centroids['cell_id'].values
     ds_out = xr.Dataset(
-        {v: xr.DataArray(np.concatenate(accum[v], axis=0), dims=('time', 'cell_id'))
+        {v: xr.DataArray(np.concatenate(accum[v], axis=0), dims=('time', 'lat', 'lon'))
          for v in accum},
-        coords={'time': time_arr, 'cell_id': cell_ids},
+        coords={'time': time_arr, 'lat': grid_lat, 'lon': grid_lon},
     )
 
-    ds_out = ds_out.chunk({'time': 30, 'cell_id': len(cell_ids)})
+    ds_out = ds_out.chunk({'time': 30, 'lat': len(grid_lat), 'lon': len(grid_lon)})
     print(f"Saving NLDAS daily zarr for WY{WY} to {save_path} ...")
     ds_out.to_zarr(save_path, mode='w', consolidated=True)
     print("Done.")
@@ -406,7 +402,7 @@ def get_nldas_wy_daily(WY, output_res, thresh, save_path=None, n_workers=8):
 
 def add_nldas_df(WY, output_res, threshold):
     """
-    Add season-to-date NLDAS met features to each training DF from the (time, cell_id) zarr.
+    Add season-to-date NLDAS met features to each training DF from the (time, lat, lon) zarr.
 
     Reads from: gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh
     Writes to:  NLDAS_gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs/{threshold}_fSCA_Thresh
@@ -449,11 +445,14 @@ def add_nldas_df(WY, output_res, threshold):
         strdate = f"{date[:4]}-{date[4:6]}-{date[6:]}"
         print(f"  NLDAS -> {region} {strdate}")
 
-        GDF      = pd.read_parquet(os.path.join(training_df_path, geofile))
-        df_cells = GDF['cell_id'].values
+        GDF  = pd.read_parquet(os.path.join(training_df_path, geofile))
+        lats = xr.DataArray(GDF['cen_lat'].values, dims='points')
+        lons = xr.DataArray(GDF['cen_lon'].values, dims='points')
         GDF.set_index('cell_id', inplace=True)
 
-        ds_sl = ds_nl.sel(time=slice(WY_start, strdate), cell_id=df_cells)
+        ds_sl = (ds_nl.sel(time=slice(WY_start, strdate))
+                      .sel(lat=lats, lon=lons, method='nearest')
+                      .load())
         T_C   = ds_sl['Tair'].values - 273.15
         SW    = ds_sl['SWdown'].values
 
