@@ -1,6 +1,6 @@
 """
 get_PRISM.py
-Download multiple PRISM 4-km daily variables, clip to a bounding box, and
+Download multiple PRISM 800m daily variables, clip to a bounding box, and
 concatenate into a single multi-band xarray Dataset per water year.
 
 Available PRISM variables-
@@ -92,6 +92,21 @@ def _unzip_var(start: datetime, stop: datetime,
                 zf.extractall(unzipped_dir)
             zip_path.unlink()
         day += timedelta(days=1)
+
+
+def _rh_from_dew(T_C, Td_C):
+    """Relative humidity (%) from temperature and dew-point (Magnus formula)."""
+    es = 6.112 * np.exp(17.67 * T_C  / (T_C  + 243.5))
+    ed = 6.112 * np.exp(17.67 * Td_C / (Td_C + 243.5))
+    return np.clip(ed / es * 100.0, 0.0, 100.0)
+
+
+def _precip_phase(precip, T_C, RH):
+    """Jennings et al. (2018) binary phase partition. Returns (snow, rain)."""
+    P_snow = 1.0 / (1.0 + np.exp(-10.04 + 1.41 * T_C + 0.09 * RH))
+    snow = np.where(P_snow >= 0.5, precip, 0.0).astype(np.float32)
+    rain = np.where(P_snow < 0.5,  precip, 0.0).astype(np.float32)
+    return snow, rain
 
 
 # Load one variable as a time-indexed DataArray, clipped to bbox
@@ -228,70 +243,93 @@ def get_prism(WY: int,
 def add_prism_df(WY: int,
                  output_res: int,
                  threshold: int,
-                 prism_var: str = 'ppt',
                  home: Path | str = HOME) -> None:
     """
-    Join PRISM seasonal precipitation (or any PRISM variable) to training
-    DataFrames by nearest-neighbor lookup on lat/lon.
+    Join PRISM precipitation, phase-partitioned snow/rain, and ablation
+    features to training DataFrames by nearest-neighbor lookup on lat/lon.
 
-    Parameters
--
-    WY         : Water year.
-    output_res : Resolution in m (used to locate training DFs).
-    threshold  : fSCA threshold (used to locate training DFs).
-    prism_var  : Which variable from the multi-band PRISM NetCDF to use
-                 (default 'ppt').
-    home       : Project root directory.
+    Requires ppt, tmean, and tdmean in the PRISM Zarr store.
+
+    New columns:
+        PRISM_precip  - season-to-date total precipitation (mm)
+        PRISM_snow    - season-to-date snow via Jennings (2018) (mm)
+        PRISM_rain    - season-to-date rain via Jennings (2018) (mm)
+        PRISM_APDD    - accumulated positive degree-days since Oct 1 (deg C days)
+        PRISM_T7d     - 7-day mean temperature ending on obs date (deg C)
+        PRISM_T14d    - 14-day mean temperature ending on obs date (deg C)
     """
     home = Path(home)
     training_df_path = (home / 'data' / 'TrainingDFs' / str(WY)
                         / f'{output_res}M_Resolution'
-                        / 'AORCgridMETNLDASDaymet_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs'
+                        / 'AORC_NLDAS_gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs'
                         / f'{threshold}_fSCA_Thresh')
     df_path = (home / 'data' / 'TrainingDFs' / str(WY)
                / f'{output_res}M_Resolution'
-               / 'PRISM_AORCgridMETNLDASDaymet_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs'
+               / 'PRISM_AORC_NLDAS_gridMET_Vegetation_Sturm_Seasonality_VIIRSGeoObsDFs'
                / f'{threshold}_fSCA_Thresh')
     df_path.mkdir(parents=True, exist_ok=True)
 
     training_dfs = [f for f in os.listdir(training_df_path) if f.endswith('.parquet')]
 
-    prism_store = home / 'data' / 'Precipitation' / str(WY) / 'prism_800m' / f'{WY}.zarr'
+    # prism_store = home / 'data' / 'Precipitation' / str(WY) / 'prism_800m' / f'{WY}.zarr'
+    prism_store = Path(f'/uufs/chpc.utah.edu/common/home/johnsonrc-group1/PRISM/800m/{WY}.zarr')
+
     obs_precip = xr.open_zarr(prism_store)
-    WY_start = f'{WY-1}-10-01'
-
-    for geofile in tqdm(training_dfs, desc='Processing PRISM files'):
-        date   = geofile.split('_')[-1].split('.parquet')[0]
-        region = geofile.split('_')[-2]
-        strdate = f'{date[:4]}-{date[4:6]}-{date[6:]}'
-        print(f'  Connecting PRISM {prism_var} to ASO observations on {strdate} at {region}')
-
-        GDF  = pd.read_parquet(training_df_path / geofile)
-        meta = GDF[['cell_id', 'cen_lat', 'cen_lon']]
-        GDF.set_index('cell_id', inplace=True)
-
-        # clip to bounding box
-        left, right  = meta['cen_lon'].min() - 0.1, meta['cen_lon'].max() + 0.1
-        bottom, top  = meta['cen_lat'].min() - 0.1, meta['cen_lat'].max() + 0.1
-
-        obs_slice = obs_precip[prism_var].sel(
-            time=slice(WY_start, strdate),
-            lat=slice(bottom, top),
-            lon=slice(left, right),
+    missing_vars = [v for v in ('ppt', 'tmean', 'tdmean') if v not in obs_precip]
+    if missing_vars:
+        obs_precip.close()
+        raise KeyError(
+            f"PRISM Zarr store missing required variables: {missing_vars}. "
+            "Run get_prism(WY, vars=['ppt','tmean','tdmean']) first."
         )
+    WY_start = f'{WY-1}-10-01'
+    lat_asc  = obs_precip.lat.values[0] < obs_precip.lat.values[-1]
 
-        lats = xr.DataArray(meta['cen_lat'].values, dims='points')
-        lons = xr.DataArray(meta['cen_lon'].values, dims='points')
-        pr_at_pts = obs_slice.sel(lat=lats, lon=lons, method='nearest')
-        season_precip = np.round(pr_at_pts.values.sum(axis=0) / 10, 2)
+    def _extract(var, strdate, lat_s, left, right, lats, lons):
+        return obs_precip[var].sel(
+            time=slice(WY_start, strdate),
+            lat=lat_s,
+            lon=slice(left, right),
+        ).sel(lat=lats, lon=lons, method='nearest').values
 
-        GDF['PRISM'] = season_precip
-        GDF.reset_index(inplace=True)
+    try:
+        for geofile in tqdm(training_dfs, desc='Processing PRISM files'):
+            date   = geofile.split('_')[-1].split('.parquet')[0]
+            region = geofile.split('_')[-2]
+            strdate = f'{date[:4]}-{date[4:6]}-{date[6:]}'
+            print(f'  Connecting PRISM to ASO observations on {strdate} at {region}')
 
-        table = pa.Table.from_pandas(GDF)
-        pq.write_table(table, df_path / f'PRISM_{geofile}', compression='BROTLI')
+            GDF  = pd.read_parquet(training_df_path / geofile)
+            meta = GDF[['cell_id', 'cen_lat', 'cen_lon']]
+            GDF.set_index('cell_id', inplace=True)
 
-    obs_precip.close()
+            left, right  = meta['cen_lon'].min() - 0.1, meta['cen_lon'].max() + 0.1
+            bottom, top  = meta['cen_lat'].min() - 0.1, meta['cen_lat'].max() + 0.1
+            lat_s        = slice(bottom, top) if lat_asc else slice(top, bottom)
+
+            lats = xr.DataArray(meta['cen_lat'].values, dims='points')
+            lons = xr.DataArray(meta['cen_lon'].values, dims='points')
+
+            ppt_vals    = _extract('ppt',    strdate, lat_s, left, right, lats, lons)
+            tmean_vals  = _extract('tmean',  strdate, lat_s, left, right, lats, lons)
+            tdmean_vals = _extract('tdmean', strdate, lat_s, left, right, lats, lons)
+
+            RH = _rh_from_dew(tmean_vals, tdmean_vals)
+            snow_arr, rain_arr = _precip_phase(ppt_vals, tmean_vals, RH)
+
+            GDF['PRISM_precip'] = np.round(ppt_vals.sum(axis=0),                    2)
+            GDF['PRISM_snow']   = np.round(snow_arr.sum(axis=0),                    2)
+            GDF['PRISM_rain']   = np.round(rain_arr.sum(axis=0),                    2)
+            GDF['PRISM_APDD']   = np.round(np.maximum(tmean_vals, 0).sum(axis=0),   2)
+            GDF['PRISM_T7d']    = np.round(tmean_vals[-7:].mean(axis=0),            2)
+            GDF['PRISM_T14d']   = np.round(tmean_vals[-14:].mean(axis=0),           2)
+
+            GDF.reset_index(inplace=True)
+
+            table = pa.Table.from_pandas(GDF)
+            pq.write_table(table, df_path / f'PRISM_{geofile}', compression='BROTLI')
+    finally:
+        obs_precip.close()
 
 
 if __name__ == '__main__':

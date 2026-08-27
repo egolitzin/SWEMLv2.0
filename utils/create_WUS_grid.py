@@ -56,7 +56,8 @@ def create_WUS_grid(output_res, bbox_wgs84=DEFAULT_BBOX):
     Generate a persistent-snow WUS grid at output_res meters in EPSG:5070.
 
     Grid cells are aligned to the EPSG:5070 coordinate origin. Cells with
-    Sturm class 0 (no data) or 4 (ephemeral) are excluded.
+    Sturm classes 4 (ephemeral) 8 (ocean) and 9 (fill) are excluded.
+    Future refinement may also exclude 5 (prairie) subject to an elevation or slope filter 
 
     Resampling from the ~300m Sturm raster:
         output_res <= 300m: nearest-neighbor
