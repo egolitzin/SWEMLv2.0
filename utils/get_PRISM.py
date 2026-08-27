@@ -185,8 +185,8 @@ def get_prism(WY: int,
     Returns: Path to the output Zarr store.
     """
     home = Path(home)
-    prism_path = Path('/uufs/chpc.utah.edu/common/home/johnsonrc-group1/PRISM/800m')
-    # prism_path = home / 'data' / 'Precipitation' / str(WY) / 'prism_800m'
+    # prism_path = Path('/uufs/chpc.utah.edu/common/home/johnsonrc-group1/PRISM/800m')
+    prism_path = home / 'data' / 'Precipitation' / str(WY) / 'prism_800m'
     out_store  = prism_path / f'{WY}.zarr'
 
     prism_path.mkdir(parents=True, exist_ok=True)
